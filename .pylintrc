@@ -1,0 +1,15 @@
+[MASTER]
+ignore=.git,__pycache__,.pytest_cache
+
+[MESSAGES CONTROL]
+disable=
+    broad-exception-caught,
+    mixed-line-endings,
+    too-many-lines,
+    too-many-instance-attributes,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-locals
+
+[FORMAT]
+max-line-length=100
