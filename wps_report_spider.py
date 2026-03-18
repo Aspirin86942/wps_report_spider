@@ -113,6 +113,8 @@ KEYWORD_HIGHLIGHT_COLUMNS: list[str] = [
     "产品类型_list",
     "产品名称_list",
 ]
+KEYWORD_HIGHLIGHT_COLOR: str = "FFFF0000"
+KEYWORD_HIGHLIGHT_FILL_COLOR: str = "FFFFF2CC"
 
 # =========================
 # 日志配置
@@ -216,6 +218,22 @@ def clear_sheet_contents(sheet_name: str) -> None:
             used_range.ClearContents()
     except Exception as exc:
         raise RuntimeError(f"清空工作表失败: {sheet_name}") from exc
+
+
+def clear_sheet_formats(sheet_name: str) -> None:
+    """
+    清空工作表已用区域格式，避免重跑后保留旧高亮。
+    """
+    worksheet = get_worksheet(sheet_name)
+    if worksheet is None:
+        return
+
+    try:
+        used_range = worksheet.UsedRange
+        if used_range is not None:
+            used_range.ClearFormats()
+    except Exception as exc:
+        raise RuntimeError(f"清空工作表格式失败: {sheet_name}") from exc
 
 
 def read_sheet_df(sheet_name: str, strict: bool = False) -> pd.DataFrame:
@@ -1936,7 +1954,7 @@ def build_keyword_highlight_pattern(keywords: list[str]) -> re.Pattern[str] | No
 
 def add_keyword_hit_flags(result_df: pd.DataFrame) -> pd.DataFrame:
     """
-    为结果增加关键词命中标记列，替代 openpyxl 富文本高亮。
+    为结果增加关键词命中标记列，供结果表样式高亮与人工筛选复核。
     """
     if result_df.empty:
         output_df = result_df.copy()
@@ -1966,6 +1984,93 @@ def add_keyword_hit_flags(result_df: pd.DataFrame) -> pd.DataFrame:
 
     result["keyword_hit_any"] = result[hit_cols].any(axis=1) if hit_cols else False
     return result
+
+
+def parse_wps_color_argb(color: str) -> int:
+    """
+    将 ARGB 十六进制颜色转换为 WPS/Excel 对象模型可接受的整数颜色值。
+
+    这里显式忽略 alpha，只保留 RGB，避免运行时对透明度解释不一致。
+    """
+    normalized_color = color.strip() if isinstance(color, str) else ""
+    if not re.fullmatch(r"[0-9A-Fa-f]{8}", normalized_color):
+        raise ValueError(f"非法颜色配置，必须为 8 位 ARGB 十六进制字符串: {color}")
+
+    rgb_hex = normalized_color[2:]
+    red = int(rgb_hex[0:2], 16)
+    green = int(rgb_hex[2:4], 16)
+    blue = int(rgb_hex[4:6], 16)
+    return red + (green << 8) + (blue << 16)
+
+
+def clear_keyword_highlight_style(cell: Any, row_num: int, column_name: str) -> None:
+    """
+    清理单元格旧格式，避免重跑时残留历史高亮。
+    """
+    try:
+        cell.ClearFormats()
+    except Exception as exc:
+        raise RuntimeError(
+            "清理关键词高亮旧格式失败: "
+            f"row={row_num}, column={column_name}"
+        ) from exc
+
+
+def apply_keyword_highlight(sheet_name: str, result_df: pd.DataFrame) -> None:
+    """
+    按命中布尔列对结果表数据区做整格高亮。
+    """
+    if result_df.empty:
+        return
+
+    worksheet = get_worksheet(sheet_name)
+    if worksheet is None:
+        raise RuntimeError(f"关键词高亮失败，工作表不存在: {sheet_name}")
+
+    font_color = parse_wps_color_argb(KEYWORD_HIGHLIGHT_COLOR)
+    fill_color = parse_wps_color_argb(KEYWORD_HIGHLIGHT_FILL_COLOR)
+    column_positions: dict[str, int] = {
+        column_name: index + 1 for index, column_name in enumerate(result_df.columns)
+    }
+
+    for column_name in KEYWORD_HIGHLIGHT_COLUMNS:
+        if column_name not in column_positions:
+            continue
+
+        hit_col = f"hit_{column_name}"
+        if hit_col not in result_df.columns:
+            raise KeyError(f"结果表缺少关键词命中列: {hit_col}")
+
+        column_index = column_positions[column_name]
+        hit_flags = result_df[hit_col].fillna(False).astype(bool).tolist()
+
+        # 样式阶段只依赖前置计算好的 hit_* 列，避免再次做正则匹配导致规则漂移。
+        for row_num, is_hit in enumerate(hit_flags, start=2):
+            try:
+                cell = worksheet.Cells(row_num, column_index)
+            except Exception as exc:
+                raise RuntimeError(
+                    "获取关键词高亮目标单元格失败: "
+                    f"row={row_num}, column={column_name}"
+                ) from exc
+
+            clear_keyword_highlight_style(
+                cell=cell,
+                row_num=row_num,
+                column_name=column_name,
+            )
+
+            if not is_hit:
+                continue
+
+            try:
+                cell.Font.Color = font_color
+                cell.Interior.Color = fill_color
+            except Exception as exc:
+                raise RuntimeError(
+                    "写入关键词高亮样式失败: "
+                    f"row={row_num}, column={column_name}"
+                ) from exc
 
 
 def build_stock_base_df(result_df: pd.DataFrame) -> pd.DataFrame:
@@ -2575,7 +2680,9 @@ def write_outputs_to_wps(
 
     export_df = add_keyword_hit_flags(export_df)
 
+    clear_sheet_formats(RESULT_SHEET)
     write_sheet_df(export_df, RESULT_SHEET)
+    apply_keyword_highlight(RESULT_SHEET, export_df)
     write_sheet_df(error_log, ERROR_LOG_SHEET)
     write_sheet_df(integrity_report, INTEGRITY_REPORT_SHEET)
     write_sheet_df(concept_summary_df, CONCEPT_SUMMARY_SHEET)
