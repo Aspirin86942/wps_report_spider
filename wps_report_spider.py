@@ -7,6 +7,7 @@ import math
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, cast
@@ -142,7 +143,24 @@ write_xl: Callable[..., Any] = globals().get("write_xl", _missing_wps_runtime)
 
 @dataclass
 class CrawlConfig:
-    """运行期配置。"""
+    """运行期配置。
+
+    Attributes:
+        search_key: 搜索关键词，不能为空。
+        start_date: 起始日期，格式 YYYY-MM-DD。
+        end_date: 结束日期，格式 YYYY-MM-DD。
+        page_size: 每页条数，范围 1-100，默认 20。
+        sleep_min_seconds: 请求间隔最小秒数。
+        sleep_max_seconds: 请求间隔最大秒数。
+        concept_sleep_seconds: 概念抓取间隔秒数。
+        operate_sleep_seconds: 主营抓取间隔秒数。
+        is_fulltext: 是否全文搜索。
+        sort_name: 排序字段，默认 "pubdate"。
+        sort_type: 排序方向，默认 "desc"。
+        type_value: 公告类型过滤。
+        max_concurrent_workers: 最大并发线程数，默认 5。
+        per_request_timeout: 单次请求超时秒数，默认 30。
+    """
 
     search_key: str
     start_date: str
@@ -156,6 +174,8 @@ class CrawlConfig:
     sort_name: str = "pubdate"
     sort_type: str = "desc"
     type_value: str = ""
+    max_concurrent_workers: int = 5
+    per_request_timeout: float = 30.0
 
 
 DEFAULT_CRAWL_CONFIG: CrawlConfig = CrawlConfig(
@@ -271,7 +291,7 @@ def write_sheet_df(df: pd.DataFrame, sheet_name: str) -> None:
     """
     将 DataFrame 写回 WPS 工作表。
     处理策略：
-    1. 先尝试按“已存在 sheet”覆盖写入
+    1. 先尝试按"已存在 sheet"覆盖写入
     2. 若明确不存在，再尝试 new_sheet=True
     3. 若出现 duplicated sheet_name，说明已存在，回退到覆盖写入
     """
@@ -286,7 +306,7 @@ def write_sheet_df(df: pd.DataFrame, sheet_name: str) -> None:
     except Exception as exc:
         logger.warning("清空工作表失败，继续尝试写入：%s | %s", sheet_name, exc)
 
-    # 第一优先级：按“已存在 sheet”写入
+    # 第一优先级：按"已存在 sheet"写入
     try:
         write_xl(payload, range="A1", sheet_name=sheet_name, write_df_index=False)
         logger.info(
@@ -299,7 +319,7 @@ def write_sheet_df(df: pd.DataFrame, sheet_name: str) -> None:
     except Exception as exc:
         first_error = exc
 
-    # 第二优先级：如果看起来像“不存在”，则尝试新建
+    # 第二优先级：如果看起来像"不存在"，则尝试新建
     try:
         write_xl(
             payload,
@@ -528,6 +548,8 @@ def load_runtime_config() -> tuple[CrawlConfig, pd.DataFrame, pd.DataFrame]:
             "sort_name": str,
             "sort_type": str,
             "type_value": str,
+            "max_concurrent_workers": int,
+            "per_request_timeout": float,
         }
         for key, parser in parsers.items():
             raw_value = raw_config_map.get(key)
@@ -569,6 +591,84 @@ def load_runtime_config() -> tuple[CrawlConfig, pd.DataFrame, pd.DataFrame]:
         )
         config_values["sleep_min_seconds"] = DEFAULT_CRAWL_CONFIG.sleep_min_seconds
         config_values["sleep_max_seconds"] = DEFAULT_CRAWL_CONFIG.sleep_max_seconds
+
+    # 输入验证：日期格式校验
+    date_pattern = r"^\d{4}-\d{2}-\d{2}$"
+    for date_field in ["start_date", "end_date"]:
+        date_value = config_values.get(date_field, "")
+        if date_value and not re.fullmatch(date_pattern, date_value):
+            config_errors.append(
+                make_error_record(
+                    source="config",
+                    severity="ERROR",
+                    error_type="InvalidDateFormat",
+                    message=f"{date_field} 格式错误，期望 YYYY-MM-DD，实际为：{date_value}",
+                    error_code="CONFIG_DATE_FORMAT_INVALID",
+                    retryable=False,
+                    field_name=date_field,
+                    raw_value=date_value,
+                    action="回退默认值",
+                )
+            )
+            config_values[date_field] = getattr(DEFAULT_CRAWL_CONFIG, date_field)
+
+    # 输入验证：日期范围校验
+    if (
+        config_values.get("start_date")
+        and config_values.get("end_date")
+        and config_values["start_date"] > config_values["end_date"]
+    ):
+        config_errors.append(
+            make_error_record(
+                source="config",
+                severity="ERROR",
+                error_type="InvalidDateRange",
+                message=f"start_date ({config_values['start_date']}) 不能晚于 end_date ({config_values['end_date']})",
+                error_code="CONFIG_DATE_RANGE_INVALID",
+                retryable=False,
+                field_name="start_date,end_date",
+                raw_value=f"{config_values['start_date']},{config_values['end_date']}",
+                action="交换日期或回退默认值",
+            )
+        )
+        config_values["start_date"] = DEFAULT_CRAWL_CONFIG.start_date
+        config_values["end_date"] = DEFAULT_CRAWL_CONFIG.end_date
+
+    # 输入验证：page_size 范围校验
+    page_size = config_values.get("page_size", 20)
+    if not (1 <= page_size <= 100):
+        config_errors.append(
+            make_error_record(
+                source="config",
+                severity="ERROR",
+                error_type="InvalidPageSize",
+                message=f"page_size 必须在 1-100 之间，实际为：{page_size}",
+                error_code="CONFIG_PAGE_SIZE_INVALID",
+                retryable=False,
+                field_name="page_size",
+                raw_value=str(page_size),
+                action="回退默认值",
+            )
+        )
+        config_values["page_size"] = 20
+
+    # 输入验证：search_key 非空校验
+    search_key = config_values.get("search_key", "")
+    if not search_key or not str(search_key).strip():
+        config_errors.append(
+            make_error_record(
+                source="config",
+                severity="ERROR",
+                error_type="EmptySearchKey",
+                message="search_key 不能为空",
+                error_code="CONFIG_SEARCH_KEY_EMPTY",
+                retryable=False,
+                field_name="search_key",
+                raw_value=str(search_key),
+                action="回退默认值",
+            )
+        )
+        config_values["search_key"] = DEFAULT_CRAWL_CONFIG.search_key
 
     config = CrawlConfig(**config_values)
     config_integrity_report = pd.DataFrame(
@@ -911,7 +1011,7 @@ def clean_text(text: str) -> str:
 
 def split_items(text: str) -> list[str]:
     """
-    将“产品类型/产品名称”拆分为结构化列表。
+    将"产品类型/产品名称"拆分为结构化列表。
     """
     normalized_text: str = clean_text(text)
     if not normalized_text:
@@ -1215,37 +1315,124 @@ def collect_miss_code_results(
     sleep_seconds: float,
     success_log_message: str,
     failure_log_message: str,
+    max_workers: int = 5,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """
-    统一执行 miss-code 抓取循环。
+    统一执行 miss-code 抓取循环（支持并发）。
+
+    Args:
+        miss_codes: 待抓取的证券代码列表。
+        session_builder: Session 构建函数。
+        per_code_handler: 单股票处理函数。
+        source: 错误记录来源。
+        severity: 错误严重程度。
+        sleep_seconds: 请求间隔秒数。
+        success_log_message: 成功日志模板。
+        failure_log_message: 失败日志模板。
+        max_workers: 最大并发线程数，默认 5。
+
+    Returns:
+        (success_records, error_records) 元组。
     """
     success_records: list[dict[str, Any]] = []
     error_records: list[dict[str, Any]] = []
     if not miss_codes:
         return success_records, error_records
 
-    session = session_builder()
-    for stock_code in miss_codes:
+    # 判断是否为网络相关异常（应降级为 WARN）
+    def is_network_error(exc: Exception) -> bool:
+        """判断异常是否为网络相关错误（可重试的暂时性故障）。"""
+        exc_str = str(exc).lower()
+        network_keywords = [
+            "connection", "timeout", "name resolution", "remote disconnected",
+            "max retries", "network", "503", "502", "504", "temporary failure"
+        ]
+        return any(kw in exc_str for kw in network_keywords)
+
+    # 单线程模式（保持原有行为）
+    if max_workers <= 1:
+        session = session_builder()
+        for stock_code in miss_codes:
+            try:
+                record, warning_records = per_code_handler(session, stock_code)
+                if warning_records:
+                    error_records.extend(warning_records)
+                if record is not None:
+                    success_records.append(record)
+                    logger.info(success_log_message, stock_code)
+            except Exception as exc:
+                logger.exception(failure_log_message, stock_code)
+                # 网络错误降级为 WARN，其他错误保持原有严重性
+                error_severity = "WARN" if is_network_error(exc) else severity
+                error_records.append(
+                    {
+                        "source": source,
+                        "severity": error_severity,
+                        "stock_code": stock_code,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                        "retryable": is_network_error(exc),
+                    }
+                )
+            time.sleep(sleep_seconds)
+        return success_records, error_records
+
+    # 并发模式
+    logger.info(
+        "开始并发抓取：miss_codes=%s, max_workers=%s", len(miss_codes), max_workers
+    )
+
+    def fetch_single_code(stock_code: str) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]], str | None, str | None]:
+        """
+        内部包装函数，捕获异常并返回结构化结果。
+
+        Returns:
+            (stock_code, record, warning_records, error_msg, error_type)
+        """
         try:
+            session = session_builder()
             record, warning_records = per_code_handler(session, stock_code)
+            return stock_code, record, warning_records, None, None
+        except Exception as exc:
+            return stock_code, None, [], str(exc), type(exc).__name__
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_code = {executor.submit(fetch_single_code, code): code for code in miss_codes}
+
+        for future in as_completed(future_to_code):
+            try:
+                stock_code, record, warning_records, error_msg, error_type = future.result()
+            except Exception as exc:
+                # 处理 executor 级别的异常
+                stock_code = future_to_code[future]
+                error_msg = str(exc)
+                error_type = type(exc).__name__
+                record, warning_records = None, []
+
             if warning_records:
                 error_records.extend(warning_records)
+
             if record is not None:
                 success_records.append(record)
                 logger.info(success_log_message, stock_code)
-        except Exception as exc:
-            logger.exception(failure_log_message, stock_code)
-            error_records.append(
-                {
-                    "source": source,
-                    "severity": severity,
-                    "stock_code": stock_code,
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                }
-            )
 
-        time.sleep(sleep_seconds)
+            if error_msg:
+                logger.exception(failure_log_message, stock_code)
+                # 网络错误降级为 WARN，其他错误保持原有严重性
+                error_severity = "WARN" if is_network_error(error_msg) else severity
+                error_records.append(
+                    {
+                        "source": source,
+                        "severity": error_severity,
+                        "stock_code": stock_code,
+                        "error_type": error_type or "ConcurrentFetchError",
+                        "error_message": error_msg,
+                        "retryable": is_network_error(error_msg),
+                    }
+                )
+
+            # 并发模式下也需要限速，避免触发风控
+            time.sleep(sleep_seconds)
 
     return success_records, error_records
 
@@ -1253,6 +1440,18 @@ def collect_miss_code_results(
 def fetch_page(session: Session, config: CrawlConfig, page_num: int) -> dict[str, Any]:
     """
     拉取单页 JSON。
+
+    Args:
+        session: 已初始化的 requests Session。
+        config: 爬取配置。
+        page_num: 页码。
+
+    Returns:
+        CNINFO API 响应字典。
+
+    Raises:
+        ValueError: Content-Type 非 JSON 或响应体过大。
+        TypeError: 响应 JSON 不是 dict 类型。
     """
     params: dict[str, Any] = {
         "searchkey": config.search_key,
@@ -1266,8 +1465,18 @@ def fetch_page(session: Session, config: CrawlConfig, page_num: int) -> dict[str
         "type": config.type_value,
     }
 
-    resp: Response = session.get(BASE_URL, params=params, timeout=30)
+    resp: Response = session.get(
+        BASE_URL, params=params, timeout=(5, config.per_request_timeout)
+    )
     resp.raise_for_status()
+
+    # 响应大小检查（防 DoS）
+    content_length: int | None = resp.headers.get("Content-Length")
+    if content_length is not None and int(content_length) > 5 * 1024 * 1024:
+        raise ValueError(
+            f"响应体过大 ({content_length} bytes)，超过 5MB 限制，"
+            "可能意味着被风控或页面策略有变。"
+        )
 
     content_type: str = resp.headers.get("Content-Type", "")
     if "application/json" not in content_type:
@@ -1297,7 +1506,7 @@ def strip_html_em(text: Any) -> str:
 
 def extract_concepts_from_html(html_text: str) -> tuple[list[str], str]:
     """
-    从同花顺个股页 HTML 中提取“涉及概念”。
+    从同花顺个股页 HTML 中提取"涉及概念"。
     """
     soup = BeautifulSoup(html_text, "html.parser")
 
@@ -1334,7 +1543,17 @@ def extract_concepts_from_html(html_text: str) -> tuple[list[str], str]:
 
 def fetch_stock_concepts(session: Session, stock_code: str) -> dict[str, Any]:
     """
-    按同花顺抓取代码抓取单只股票的“涉及概念”。
+    按同花顺抓取代码抓取单只股票的"涉及概念"。
+
+    Args:
+        session: 已初始化的 requests Session。
+        stock_code: 证券代码（6 位 A 股或 HK 开头港股）。
+
+    Returns:
+        包含 fetch_code, concept_count, concept_list, concept_text_raw, concept_source_url 的字典。
+
+    Raises:
+        ValueError: Content-Type 非 HTML 或页面缺少目标字段。
     """
     code: str = normalize_ths_fetch_code(stock_code)
     url: str = f"{THS_STOCK_PAGE_URL}/{code}/"
@@ -1369,6 +1588,16 @@ def handle_single_concept_stock(
 def fetch_operate_html(session: Session, stock_code: str) -> str:
     """
     按同花顺抓取代码下载主营介绍页面 HTML。
+
+    Args:
+        session: 已初始化的 requests Session。
+        stock_code: 证券代码（6 位 A 股或 HK 开头港股）。
+
+    Returns:
+        页面 HTML 文本。
+
+    Raises:
+        ValueError: Content-Type 非 HTML。
     """
     code: str = normalize_ths_fetch_code(stock_code)
     url: str = f"{THS_OPERATE_PAGE_URL}/{code}/operate.html"
@@ -1547,19 +1776,28 @@ def handle_single_operate_stock(
 
 def build_any_non_empty_text_mask(df: pd.DataFrame, columns: list[str]) -> pd.Series:
     """
-    统一判断一组文本字段中是否至少有一个非空。
+    统一判断一组文本字段中是否至少有一个非空（纯向量化实现）。
+
+    Args:
+        df: 输入 DataFrame。
+        columns: 待检查的列名列表。
+
+    Returns:
+        布尔 Series，True 表示至少有一个字段非空。
     """
     if df.empty:
         return pd.Series(dtype="bool")
 
-    return (
-        df.loc[:, columns]
-        .fillna("")
-        .astype("string")
-        .apply(lambda col: col.str.strip())
-        .ne("")
-        .any(axis=1)
-    )
+    # 纯向量化：使用 applymap 替代 apply(lambda col: col.str.strip())
+    # 注意：applymap 在 pandas 2.1+ 已被 map 替代，但为兼容性保留 applymap
+    try:
+        # pandas >= 2.1.0 使用 map
+        stripped = df.loc[:, columns].fillna("").astype("string").map(lambda x: str(x).strip())
+    except AttributeError:
+        # pandas < 2.1.0 使用 applymap
+        stripped = df.loc[:, columns].fillna("").astype("string").applymap(lambda x: str(x).strip())
+
+    return stripped.ne("").any(axis=1)
 
 
 def has_non_empty_concept_list(df: pd.DataFrame) -> pd.Series:
@@ -1672,9 +1910,19 @@ def batch_get_stock_concepts(
     stock_codes: list[str],
     cache_sheet: str = CONCEPT_CACHE_SHEET,
     sleep_seconds: float = CONCEPT_SLEEP_SECONDS,
+    max_workers: int = 5,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    批量抓取证券代码对应的同花顺“涉及概念”，并复用工作表缓存。
+    批量抓取证券代码对应的同花顺"涉及概念"，并复用工作表缓存。
+
+    Args:
+        stock_codes: 证券代码列表。
+        cache_sheet: 缓存工作表名称。
+        sleep_seconds: 请求间隔秒数。
+        max_workers: 最大并发线程数，默认 5。
+
+    Returns:
+        (concept_result_df, integrity_report, error_log) 元组。
     """
     requested_code_df, initial_error_log = prepare_requested_codes(
         stock_codes=stock_codes,
@@ -1722,6 +1970,7 @@ def batch_get_stock_concepts(
         sleep_seconds=sleep_seconds,
         success_log_message="同花顺概念抓取成功：%s",
         failure_log_message="同花顺概念抓取失败：%s",
+        max_workers=max_workers,
     )
     error_records.extend(fetch_error_records)
 
@@ -1785,9 +2034,19 @@ def batch_get_stock_operate(
     stock_codes: list[str],
     cache_sheet: str = OPERATE_CACHE_SHEET,
     sleep_seconds: float = OPERATE_SLEEP_SECONDS,
+    max_workers: int = 5,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     批量抓取证券代码对应的同花顺主营介绍，并复用工作表缓存。
+
+    Args:
+        stock_codes: 证券代码列表。
+        cache_sheet: 缓存工作表名称。
+        sleep_seconds: 请求间隔秒数。
+        max_workers: 最大并发线程数，默认 5。
+
+    Returns:
+        (operate_result_df, integrity_report, error_log) 元组。
     """
     requested_code_df, initial_error_log = prepare_requested_codes(
         stock_codes=stock_codes,
@@ -1835,6 +2094,7 @@ def batch_get_stock_operate(
         sleep_seconds=sleep_seconds,
         success_log_message="同花顺主营抓取成功：%s",
         failure_log_message="同花顺主营抓取失败：%s",
+        max_workers=max_workers,
     )
     error_records.extend(fetch_error_records)
 
@@ -2018,14 +2278,15 @@ def clear_keyword_highlight_style(cell: Any, row_num: int, column_name: str) -> 
 
 def apply_keyword_highlight(sheet_name: str, result_df: pd.DataFrame) -> None:
     """
-    按命中布尔列对结果表数据区做整格高亮。
+    按命中布尔列对结果表数据区做关键词局部高亮（仅高亮匹配文本，非整个单元格）。
+    使用 Characters() 方法定位匹配字符范围；若不支持则降级为整格高亮。
     """
     if result_df.empty:
         return
 
     worksheet = get_worksheet(sheet_name)
     if worksheet is None:
-        raise RuntimeError(f"关键词高亮失败，工作表不存在: {sheet_name}")
+        raise RuntimeError(f"关键词高亮失败，工作表不存在：{sheet_name}")
 
     font_color = parse_wps_color_argb(KEYWORD_HIGHLIGHT_COLOR)
     fill_color = parse_wps_color_argb(KEYWORD_HIGHLIGHT_FILL_COLOR)
@@ -2033,24 +2294,29 @@ def apply_keyword_highlight(sheet_name: str, result_df: pd.DataFrame) -> None:
         column_name: index + 1 for index, column_name in enumerate(result_df.columns)
     }
 
+    # 编译关键词正则（用于局部高亮定位）
+    keyword_pattern = re.compile(
+        '|'.join(re.escape(kw) for kw in KEYWORD_HIGHLIGHT_WORDS)
+    )
+
     for column_name in KEYWORD_HIGHLIGHT_COLUMNS:
         if column_name not in column_positions:
             continue
 
         hit_col = f"hit_{column_name}"
         if hit_col not in result_df.columns:
-            raise KeyError(f"结果表缺少关键词命中列: {hit_col}")
+            raise KeyError(f"结果表缺少关键词命中列：{hit_col}")
 
         column_index = column_positions[column_name]
         hit_flags = result_df[hit_col].fillna(False).astype(bool).tolist()
+        cell_texts = result_df[column_name].fillna('').astype(str).tolist()
 
-        # 样式阶段只依赖前置计算好的 hit_* 列，避免再次做正则匹配导致规则漂移。
-        for row_num, is_hit in enumerate(hit_flags, start=2):
+        for row_num, (is_hit, cell_text) in enumerate(zip(hit_flags, cell_texts), start=2):
             try:
                 cell = worksheet.Cells(row_num, column_index)
             except Exception as exc:
                 raise RuntimeError(
-                    "获取关键词高亮目标单元格失败: "
+                    "获取关键词高亮目标单元格失败："
                     f"row={row_num}, column={column_name}"
                 ) from exc
 
@@ -2063,14 +2329,95 @@ def apply_keyword_highlight(sheet_name: str, result_df: pd.DataFrame) -> None:
             if not is_hit:
                 continue
 
+            # 无文本则跳过
+            if not cell_text:
+                continue
+
             try:
-                cell.Font.Color = font_color
-                cell.Interior.Color = fill_color
+                # 尝试使用 Characters() 做局部高亮
+                matches = list(keyword_pattern.finditer(cell_text))
+
+                if not matches:
+                    # hit_flag 为 True 但无匹配，降级为整格高亮
+                    cell.Font.Color = font_color
+                    cell.Interior.Color = fill_color
+                else:
+                    # 先设置整格背景色（Characters 不支持 Interior）
+                    cell.Interior.Color = fill_color
+
+                    for match in matches:
+                        # Characters 使用 1-based 索引
+                        start_pos = match.start() + 1
+                        length = match.end() - match.start()
+                        try:
+                            char_obj = cell.Characters(start_pos, length)
+                            char_obj.Font.Color = font_color
+                            # 可选：加粗关键词
+                            char_obj.Font.Bold = True
+                        except (AttributeError, IndexError):
+                            # WPS 不支持 Characters 方法，降级为整格高亮
+                            cell.Font.Color = font_color
+                            break
             except Exception as exc:
                 raise RuntimeError(
-                    "写入关键词高亮样式失败: "
+                    "写入关键词高亮样式失败："
                     f"row={row_num}, column={column_name}"
                 ) from exc
+
+
+def apply_secCode_text_format(sheet_name: str, row_count: int) -> None:
+    """Apply text format to secCode column to preserve leading zeros.
+
+    Args:
+        sheet_name: Name of the worksheet
+        row_count: Number of data rows (excluding header)
+    """
+    worksheet = get_worksheet(sheet_name)
+    if worksheet is None:
+        raise RuntimeError(f"secCode 文本格式设置失败，工作表不存在：{sheet_name}")
+
+    try:
+        # 使用 Columns 对象设置整列为文本格式
+        # secCode 是第 3 列（C 列）
+        secCode_column = worksheet.Columns.Item(3)
+        secCode_column.NumberFormat = "@"
+
+        # 额外确保：遍历每个单元格强制设置（针对已写入的数据）
+        for row_num in range(2, row_count + 2):
+            try:
+                cell = worksheet.Cells(row_num, 3)
+                # 如果单元格已有值，先读取再重新写入，强制类型转换
+                if cell.Value is not None and cell.Value != "":
+                    cell.Value = str(cell.Value)
+            except Exception:
+                pass  # 跳过个别单元格的错误
+    except Exception as exc:
+        raise RuntimeError(
+            f"设置 secCode 文本格式失败：sheet={sheet_name}"
+        ) from exc
+
+
+def apply_header_auto_filter(sheet_name: str, column_count: int) -> None:
+    """Apply AutoFilter to header row for easy filtering.
+
+    Args:
+        sheet_name: Name of the worksheet
+        column_count: Number of columns in the sheet
+    """
+    worksheet = get_worksheet(sheet_name)
+    if worksheet is None:
+        raise RuntimeError(f"AutoFilter 设置失败，工作表不存在：{sheet_name}")
+
+    try:
+        # 使用 Rows.Item(1) 获取第 1 行，然后调用 AutoFilter() 方法
+        # 官方文档：使用 Range 对象的 AutoFilter 方法打开自动筛选
+        first_row = worksheet.Rows.Item(1)
+        if first_row is not None:
+            first_row.AutoFilter()  # 调用方法，不是设置属性
+    except Exception as exc:
+        raise RuntimeError(
+            f"设置 AutoFilter 失败：sheet={sheet_name}, columns={column_count}"
+        ) from exc
 
 
 def build_stock_base_df(result_df: pd.DataFrame) -> pd.DataFrame:
@@ -2123,7 +2470,7 @@ def append_missing_enrichment_records(
     compare_code_column: str | None = None,
 ) -> pd.DataFrame:
     """
-    统一补充“补数后仍为空”的日志。
+    统一补充"补数后仍为空"的日志。
     """
     effective_compare_column = compare_code_column or stock_code_column
     existing_error_codes: set[str] = set()
@@ -2194,9 +2541,18 @@ def build_coverage_integrity_rows(
 def enrich_announcements_with_concepts(
     result_df: pd.DataFrame,
     concept_sleep_seconds: float = CONCEPT_SLEEP_SECONDS,
+    max_workers: int = 5,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     为公告结果补充同花顺涉及概念，并产出公司概念映射和概念汇总。
+
+    Args:
+        result_df: 公告 DataFrame。
+        concept_sleep_seconds: 概念抓取间隔秒数。
+        max_workers: 最大并发线程数，默认 5。
+
+    Returns:
+        (result_df, stock_concepts_df, concept_summary_df, concept_integrity_report, concept_error_log) 元组。
     """
     stock_base_df = build_stock_base_df(result_df)
     concept_request_codes: list[str] = (
@@ -2214,6 +2570,7 @@ def enrich_announcements_with_concepts(
         batch_get_stock_concepts(
             concept_request_codes,
             sleep_seconds=concept_sleep_seconds,
+            max_workers=max_workers,
         )
     )
 
@@ -2312,9 +2669,18 @@ def enrich_announcements_with_concepts(
 def enrich_announcements_with_operate(
     result_df: pd.DataFrame,
     operate_sleep_seconds: float = OPERATE_SLEEP_SECONDS,
+    max_workers: int = 5,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     为公告结果补充同花顺主营介绍。
+
+    Args:
+        result_df: 公告 DataFrame。
+        operate_sleep_seconds: 主营抓取间隔秒数。
+        max_workers: 最大并发线程数，默认 5。
+
+    Returns:
+        (result_df, stock_operate_df, operate_integrity_report, operate_error_log) 元组。
     """
     stock_base_df = build_stock_base_df(result_df)
     operate_request_codes: list[str] = (
@@ -2331,6 +2697,7 @@ def enrich_announcements_with_operate(
         batch_get_stock_operate(
             operate_request_codes,
             sleep_seconds=operate_sleep_seconds,
+            max_workers=max_workers,
         )
     )
     stock_operate_df = stock_base_df.merge(
@@ -2676,12 +3043,20 @@ def write_outputs_to_wps(
 
     export_df = result_df.loc[:, existing_export_cols].copy()
     if "secCode" in export_df.columns:
-        export_df["secCode"] = export_df["secCode"].astype("string")
+        # 转换为字符串，并添加前导单引号强制 WPS 识别为文本
+        # 单引号在 WPS/Excel 中是文本前缀标记，不会显示在单元格中
+        export_df["secCode"] = (
+            export_df["secCode"]
+            .astype("string")
+            .apply(lambda x: "'" + str(x) if pd.notna(x) else "")
+        )
 
     export_df = add_keyword_hit_flags(export_df)
 
     clear_sheet_formats(RESULT_SHEET)
     write_sheet_df(export_df, RESULT_SHEET)
+    apply_secCode_text_format(RESULT_SHEET, len(export_df))
+    apply_header_auto_filter(RESULT_SHEET, len(export_df.columns))
     apply_keyword_highlight(RESULT_SHEET, export_df)
     write_sheet_df(error_log, ERROR_LOG_SHEET)
     write_sheet_df(integrity_report, INTEGRITY_REPORT_SHEET)
@@ -2720,11 +3095,13 @@ def main() -> None:
     ) = enrich_announcements_with_concepts(
         result_df,
         concept_sleep_seconds=config.concept_sleep_seconds,
+        max_workers=config.max_concurrent_workers,
     )
     result_df, _stock_operate_df, operate_integrity_report, operate_error_log = (
         enrich_announcements_with_operate(
             result_df,
             operate_sleep_seconds=config.operate_sleep_seconds,
+            max_workers=config.max_concurrent_workers,
         )
     )
     integrity_report = pd.concat(

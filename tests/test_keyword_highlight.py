@@ -19,15 +19,37 @@ class FakeInterior:
 
 
 @dataclass
+class FakeCharacters:
+    font: FakeFont = field(default_factory=FakeFont)
+    interior: FakeInterior = field(default_factory=FakeInterior)
+    call_args: tuple[int, int] | None = None
+
+    @property
+    def Font(self) -> FakeFont:
+        return self.font
+
+    @property
+    def Interior(self) -> FakeInterior:
+        return self.interior
+
+
+@dataclass
 class FakeCell:
     Font: FakeFont = field(default_factory=FakeFont)
     Interior: FakeInterior = field(default_factory=FakeInterior)
     clear_count: int = 0
+    characters_calls: list[FakeCharacters] = field(default_factory=list)
 
     def ClearFormats(self) -> None:
         self.Font.Color = None
         self.Interior.Color = None
         self.clear_count += 1
+
+    def Characters(self, start: int, length: int) -> FakeCharacters:
+        chars = FakeCharacters()
+        chars.call_args = (start, length)
+        self.characters_calls.append(chars)
+        return chars
 
 
 class FakeWorksheet:
@@ -114,15 +136,18 @@ def test_apply_keyword_highlight_colors_hit_cells_and_clears_old_style(
     hit_cell = worksheet.Cells(2, 1)
     miss_cell = worksheet.Cells(3, 1)
     assert hit_cell.clear_count == 1
-    assert hit_cell.Font.Color == spider.parse_wps_color_argb(
+    # "激光股份" contains "激光", so Characters() should be called for partial highlighting
+    assert len(hit_cell.characters_calls) == 1
+    assert hit_cell.characters_calls[0].Font.Color == spider.parse_wps_color_argb(
         spider.KEYWORD_HIGHLIGHT_COLOR
     )
-    assert hit_cell.Interior.Color == spider.parse_wps_color_argb(
+    assert hit_cell.characters_calls[0].Interior.Color == spider.parse_wps_color_argb(
         spider.KEYWORD_HIGHLIGHT_FILL_COLOR
     )
     assert miss_cell.clear_count == 1
     assert miss_cell.Font.Color is None
     assert miss_cell.Interior.Color is None
+    assert len(miss_cell.characters_calls) == 0
 
 
 def test_apply_keyword_highlight_skips_missing_export_column(
@@ -153,3 +178,78 @@ def test_apply_keyword_highlight_raises_when_hit_column_missing(
 
     with pytest.raises(KeyError, match="hit_secName"):
         spider.apply_keyword_highlight(spider.RESULT_SHEET, result_df)
+
+
+def test_apply_keyword_highlight_falls_back_to_cell_level_when_characters_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test fallback to cell-level highlighting when Characters() is not supported."""
+
+    @dataclass
+    class FakeCellNoCharacters:
+        Font: FakeFont = field(default_factory=FakeFont)
+        Interior: FakeInterior = field(default_factory=FakeInterior)
+        clear_count: int = 0
+
+        def ClearFormats(self) -> None:
+            self.Font.Color = None
+            self.Interior.Color = None
+            self.clear_count += 1
+
+    class FakeWorksheetNoCharacters:
+        def __init__(self) -> None:
+            self._cells: dict[tuple[int, int], FakeCellNoCharacters] = {}
+
+        def Cells(self, row: int, column: int) -> FakeCellNoCharacters:
+            return self._cells.setdefault((row, column), FakeCellNoCharacters())
+
+    worksheet = FakeWorksheetNoCharacters()
+    result_df = pd.DataFrame(
+        {
+            "secName": ["激光股份"],
+            "hit_secName": [True],
+            "keyword_hit_any": [True],
+        }
+    )
+
+    monkeypatch.setattr(spider, "get_worksheet", lambda sheet_name: worksheet)
+
+    spider.apply_keyword_highlight(spider.RESULT_SHEET, result_df)
+
+    hit_cell = worksheet.Cells(2, 1)
+    # Should fall back to cell-level highlighting
+    assert hit_cell.Font.Color == spider.parse_wps_color_argb(
+        spider.KEYWORD_HIGHLIGHT_COLOR
+    )
+    assert hit_cell.Interior.Color == spider.parse_wps_color_argb(
+        spider.KEYWORD_HIGHLIGHT_FILL_COLOR
+    )
+
+
+def test_apply_keyword_highlight_falls_back_when_no_keyword_match_in_hit_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test fallback to cell-level when hit_flag is True but text has no keyword match."""
+    worksheet = FakeWorksheet()
+    # Text "测试公司" doesn't contain any keywords, but hit_flag is True
+    result_df = pd.DataFrame(
+        {
+            "secName": ["测试公司"],
+            "hit_secName": [True],  # Manually set to True
+            "keyword_hit_any": [True],
+        }
+    )
+
+    monkeypatch.setattr(spider, "get_worksheet", lambda sheet_name: worksheet)
+
+    spider.apply_keyword_highlight(spider.RESULT_SHEET, result_df)
+
+    hit_cell = worksheet.Cells(2, 1)
+    # Should fall back to cell-level highlighting since no keyword match
+    assert len(hit_cell.characters_calls) == 0
+    assert hit_cell.Font.Color == spider.parse_wps_color_argb(
+        spider.KEYWORD_HIGHLIGHT_COLOR
+    )
+    assert hit_cell.Interior.Color == spider.parse_wps_color_argb(
+        spider.KEYWORD_HIGHLIGHT_FILL_COLOR
+    )
